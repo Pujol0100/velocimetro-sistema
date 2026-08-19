@@ -18,6 +18,7 @@ from PySide6.QtGui import (
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QPolygonF,
     QRadialGradient,
 )
@@ -68,6 +69,10 @@ class Mostrador(QWidget):
         self.legenda = ""
         self._suave = Suavizador()
         self._indisponivel = False
+        self._estatico = None
+        self._chave_estatico = None
+        self._canetas_arco = None
+        self._ultimo_angulo = None
         self.setFixedSize(diametro, diametro)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -77,12 +82,28 @@ class Mostrador(QWidget):
         self._suave.alvo = 0.0 if valor is None else float(valor)
 
     def avancar(self, segundos):
-        """Move o ponteiro um quadro. Devolve True se ainda esta em movimento."""
+        """Move o ponteiro um quadro. Devolve True se ainda esta em movimento.
+
+        Só pede redesenho quando o ponteiro andou o bastante para aparecer na
+        tela: a leitura muda a cada segundo, entao sem esse corte a janela
+        redesenharia continuamente e o medidor consumiria um nucleo inteiro.
+        """
         if self._suave.em_repouso:
             return False
         self._suave.passo(segundos)
-        self.update()
+        angulo = percentual_para_angulo(max(0.0, min(100.0, self._suave.atual)))
+        if (
+            self._ultimo_angulo is None
+            or abs(angulo - self._ultimo_angulo) >= 0.2
+            or self._suave.em_repouso
+        ):
+            self._ultimo_angulo = angulo
+            self.update()
         return True
+
+    def resizeEvent(self, evento):
+        self._estatico = None
+        super().resizeEvent(evento)
 
     # ------------------------------------------------------------------ pintura
 
@@ -91,6 +112,8 @@ class Mostrador(QWidget):
         pintor.setRenderHints(
             QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing
         )
+        pintor.drawPixmap(0, 0, self._camada_estatica())
+
         lado = min(self.width(), self.height())
         fator = (lado / 2.0) / RAIO
         pintor.translate(self.width() / 2.0, self.height() / 2.0)
@@ -98,18 +121,48 @@ class Mostrador(QWidget):
 
         valor = max(0.0, min(100.0, self._suave.atual))
         cor = tema.cor_da_faixa(faixa(valor))
-
-        self._aro(pintor)
-        self._face(pintor)
-        self._trilha(pintor)
         self._arco_de_valor(pintor, valor, cor)
-        self._tracos(pintor)
-        self._numeros(pintor)
         self._textos(pintor, cor)
         self._ponteiro(pintor, valor, cor)
         self._cubo(pintor)
+        pintor.end()
+
+    def _camada_estatica(self):
+        """Aro, face, textura, escala e vidro: nada disso depende do valor.
+
+        Desenhar tudo a cada quadro custa caro (gradiente conico, textura com
+        recorte, dezenas de tracos). Fica numa imagem refeita so quando o
+        tamanho do mostrador muda.
+        """
+        proporcao = self.devicePixelRatioF()
+        chave = (self.width(), self.height(), proporcao)
+        if self._estatico is not None and self._chave_estatico == chave:
+            return self._estatico
+
+        pixmap = QPixmap(
+            int(self.width() * proporcao), int(self.height() * proporcao)
+        )
+        pixmap.setDevicePixelRatio(proporcao)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        pintor = QPainter(pixmap)
+        pintor.setRenderHints(
+            QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing
+        )
+        lado = min(self.width(), self.height())
+        fator = (lado / 2.0) / RAIO
+        pintor.translate(self.width() / 2.0, self.height() / 2.0)
+        pintor.scale(fator, fator)
+        self._aro(pintor)
+        self._face(pintor)
+        self._trilha(pintor)
+        self._tracos(pintor)
+        self._numeros(pintor)
         self._reflexo(pintor)
         pintor.end()
+
+        self._estatico = pixmap
+        self._chave_estatico = chave
+        return pixmap
 
     def _aro(self, pintor):
         pintor.setPen(Qt.PenStyle.NoPen)
@@ -179,20 +232,28 @@ class Mostrador(QWidget):
             gradiente.setColorAt(posicao, cor)
         return gradiente
 
+    def _canetas_do_arco(self):
+        """O gradiente do arco nao depende do valor, so o quanto dele e traçado.
+
+        Reconstruir dois pinceis de gradiente conico a cada quadro era parte do
+        custo que fazia o medidor consumir um nucleo.
+        """
+        if self._canetas_arco is None:
+            self._canetas_arco = []
+            for largura, alfa in ((LARGURA_TRILHA * 2.2, 44), (LARGURA_TRILHA, 255)):
+                caneta = QPen(QBrush(self._gradiente_do_arco(alfa)), largura)
+                caneta.setCapStyle(Qt.PenCapStyle.FlatCap)
+                self._canetas_arco.append(caneta)
+        return self._canetas_arco
+
     def _arco_de_valor(self, pintor, valor, cor):
         if valor <= 0.2 or self._indisponivel:
             return
         varredura = int((percentual_para_angulo(valor) - ANGULO_INICIAL) * 16)
         inicio = int(ANGULO_INICIAL * 16)
         pintor.setBrush(Qt.BrushStyle.NoBrush)
-        # Tres passadas de fora para dentro simulam o halo do mostrador aceso.
-        for largura, alfa in (
-            (LARGURA_TRILHA * 2.4, 30),
-            (LARGURA_TRILHA * 1.5, 62),
-            (LARGURA_TRILHA, 255),
-        ):
-            caneta = QPen(QBrush(self._gradiente_do_arco(alfa)), largura)
-            caneta.setCapStyle(Qt.PenCapStyle.FlatCap)
+        # A passada larga e translucida faz o halo; a estreita, o traco aceso.
+        for caneta in self._canetas_do_arco():
             pintor.setPen(caneta)
             pintor.drawArc(_retangulo(RAIO_TRILHA), inicio, varredura)
 
