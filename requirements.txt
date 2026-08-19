@@ -1,0 +1,8 @@
+# Interface e desenho do mostrador
+PySide6>=6.10
+
+# Leitura de CPU, memoria e disco
+psutil>=7.0
+
+# Necessario apenas para rodar os testes
+pytest>=8.0
